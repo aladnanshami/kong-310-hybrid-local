@@ -105,7 +105,10 @@ services:
       # Hybrid DP -> CP
       KONG_CLUSTER_CONTROL_PLANE: kong-cp:8005
       KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-cp:8006
-      KONG_CLUSTER_SERVER_NAME: kong-cp
+      KONG_CLUSTER_MTLS: shared
+      KONG_CLUSTER_SERVER_NAME: kong_clustering
+      KONG_CLUSTER_TELEMETRY_SERVER_NAME: kong_clustering
+      KONG_CLUSTER_DP_LABELS: hostname:kong-cp
 
       # Same shared mTLS cert/key pair copied to DP nodes
       KONG_CLUSTER_CERT: /etc/kong/certs/cluster.crt
@@ -141,7 +144,10 @@ services:
       # Hybrid DP -> CP
       KONG_CLUSTER_CONTROL_PLANE: kong-cp:8005
       KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-cp:8006
-      KONG_CLUSTER_SERVER_NAME: kong-cp
+      KONG_CLUSTER_MTLS: shared
+      KONG_CLUSTER_SERVER_NAME: kong_clustering
+      KONG_CLUSTER_TELEMETRY_SERVER_NAME: kong_clustering
+      KONG_CLUSTER_DP_LABELS: hostname:kong-cp
 
       # Same shared mTLS cert/key pair copied to DP nodes
       KONG_CLUSTER_CERT: /etc/kong/certs/cluster.crt

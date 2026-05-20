@@ -342,7 +342,7 @@ The original repo by [pritishpattanaik](https://github.com/pritishpattanaik/kong
 
 ## Author
 
-**Adnan Shami**
+**Al Adnan Shami**
 - Learned and fixed this setup while working on Kong Enterprise hybrid deployments
 - Connect on [LinkedIn](https://linkedin.com)
 - Questions? Open an issue!

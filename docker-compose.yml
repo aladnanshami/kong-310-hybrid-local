@@ -1,35 +1,71 @@
+# =============================================================================
+# Kong Gateway 3.10 — Hybrid Mode Local Setup
+# =============================================================================
+# Architecture:
+#   PostgreSQL (storage)
+#       ↓
+#   kong-migrations (runs once to set up DB schema)
+#       ↓
+#   kong-cp (Control Plane — manages all config, no customer traffic)
+#       ↓
+#   kong-dp1 + kong-dp2 (Data Planes — serve all customer API traffic)
+#       ↓
+#   kong-dp-lb (Nginx — load balances traffic between DP1 and DP2)
+#
+# IMPORTANT: Before running, generate cluster certs using:
+#   docker run --rm -v $(pwd)/certs:/app kong/kong-gateway:3.10 \
+#     sh -c "cd /app && kong hybrid gen_cert"
+#
+# Do NOT use plain openssl — Kong Enterprise requires CN=kong_clustering
+# =============================================================================
+
 services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # Stores all Kong configuration: services, routes, plugins, consumers, etc.
+  # Only the Control Plane (kong-cp) connects to this database.
+  # Data Planes (kong-dp1, kong-dp2) do NOT use the database — they get
+  # their config from the CP via the cluster connection.
+  # ---------------------------------------------------------------------------
   kong-db:
     image: postgres:16
     container_name: kong-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: kong
-      POSTGRES_PASSWORD: kong
-      POSTGRES_DB: kong
+      POSTGRES_USER: kong         # Database username
+      POSTGRES_PASSWORD: kong     # Database password (change in production!)
+      POSTGRES_DB: kong           # Database name
     ports:
-      - "5432:5432"
+      - "5432:5432"               # Exposed for debugging — remove in production
     volumes:
-      - kong-db-data:/var/lib/postgresql/data
+      - kong-db-data:/var/lib/postgresql/data   # Persist data across restarts
     networks:
       - kong-net
     healthcheck:
+      # Wait until PostgreSQL is ready before starting Kong
       test: ["CMD-SHELL", "pg_isready -U kong -d kong"]
       interval: 5s
       timeout: 5s
       retries: 20
 
+  # ---------------------------------------------------------------------------
+  # Kong Database Migration Job
+  # Runs ONCE on first startup to create all required database tables.
+  # Exits automatically after completion — this is normal behavior.
+  # If you wipe the database (docker compose down -v), this runs again.
+  # ---------------------------------------------------------------------------
   kong-migrations:
     image: ${KONG_IMAGE:-kong/kong-gateway:3.10}
     container_name: kong-migrations
-    command: kong migrations bootstrap
-    restart: on-failure
+    command: kong migrations bootstrap   # Initialize the DB schema
+    restart: on-failure                  # Retry if DB not ready yet
     depends_on:
       kong-db:
-        condition: service_healthy
+        condition: service_healthy       # Wait for PostgreSQL to be ready
     environment:
       KONG_DATABASE: postgres
-      KONG_PG_HOST: kong-db
+      KONG_PG_HOST: kong-db             # Docker service name — resolved by Docker DNS
       KONG_PG_PORT: 5432
       KONG_PG_DATABASE: kong
       KONG_PG_USER: kong
@@ -37,6 +73,17 @@ services:
     networks:
       - kong-net
 
+  # ---------------------------------------------------------------------------
+  # Kong Control Plane (CP)
+  # The brain of the hybrid deployment. Responsibilities:
+  #   - Stores and manages all Kong config in PostgreSQL
+  #   - Exposes Admin API (port 8001) for managing services/routes/plugins
+  #   - Exposes Kong Manager UI (port 8002) for visual management
+  #   - Pushes config changes to all Data Planes via cluster connection (8005)
+  #   - Collects telemetry from Data Planes (8006)
+  #
+  # NO customer API traffic goes through the CP — only management traffic.
+  # ---------------------------------------------------------------------------
   kong-cp:
     image: ${KONG_IMAGE:-kong/kong-gateway:3.10}
     container_name: kong-cp
@@ -45,91 +92,125 @@ services:
       kong-db:
         condition: service_healthy
       kong-migrations:
-        condition: service_completed_successfully
+        condition: service_completed_successfully   # DB must be migrated first
     environment:
+      # This node is the Control Plane
       KONG_ROLE: control_plane
       KONG_DATABASE: postgres
+
+      # PostgreSQL connection details
       KONG_PG_HOST: kong-db
       KONG_PG_PORT: 5432
       KONG_PG_DATABASE: kong
       KONG_PG_USER: kong
       KONG_PG_PASSWORD: kong
 
-      # Hybrid CP/DP mTLS certs
+      # ---------------------------------------------------------------------------
+      # mTLS Cluster Certificates
+      # Used for secure communication between CP and Data Planes.
+      # CRITICAL: Generate using: kong hybrid gen_cert
+      # Do NOT use plain openssl — Kong Enterprise requires CN=kong_clustering
+      # ---------------------------------------------------------------------------
       KONG_CLUSTER_CERT: /etc/kong/certs/cluster.crt
       KONG_CLUSTER_CERT_KEY: /etc/kong/certs/cluster.key
 
-      # CP listeners
-      KONG_ADMIN_LISTEN: 0.0.0.0:8001, 0.0.0.0:8444 ssl
-      KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002, 0.0.0.0:8445 ssl
-      KONG_CLUSTER_LISTEN: 0.0.0.0:8005 ssl
-      KONG_CLUSTER_TELEMETRY_LISTEN: 0.0.0.0:8006 ssl
+      # CP network listeners
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001, 0.0.0.0:8444 ssl    # Admin API (HTTP + HTTPS)
+      KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002, 0.0.0.0:8445 ssl # Kong Manager UI
+      KONG_CLUSTER_LISTEN: 0.0.0.0:8005 ssl                  # DP cluster connections
+      KONG_CLUSTER_TELEMETRY_LISTEN: 0.0.0.0:8006 ssl        # DP telemetry data
 
-      # URLs visible from your Mac host
+      # URLs that Kong Manager uses to call the Admin API (from your Mac browser)
       KONG_ADMIN_GUI_URL: http://localhost:8002
       KONG_ADMIN_GUI_API_URL: http://localhost:8001
 
+      # Logging — send all logs to Docker stdout/stderr for easy viewing
       KONG_LOG_LEVEL: info
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_ADMIN_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
       KONG_ADMIN_ERROR_LOG: /dev/stderr
+
     ports:
-      - "8001:8001"   # Admin API HTTP
+      - "8001:8001"   # Admin API HTTP  — used by decK and curl commands
       - "8444:8444"   # Admin API HTTPS
-      - "8002:8002"   # Kong Manager HTTP
+      - "8002:8002"   # Kong Manager UI — open http://localhost:8002 in browser
       - "8445:8445"   # Kong Manager HTTPS
-      - "8005:8005"   # Hybrid cluster traffic from DP
-      - "8006:8006"   # Hybrid telemetry from DP
+      - "8005:8005"   # Cluster port — Data Planes connect here to get config
+      - "8006:8006"   # Telemetry port — Data Planes send metrics here
     volumes:
-      - ./certs:/etc/kong/certs:ro
+      - ./certs:/etc/kong/certs:ro   # Mount certs as read-only
     networks:
       - kong-net
     healthcheck:
+      # Kong is healthy when all internal subsystems report OK
       test: ["CMD", "kong", "health"]
       interval: 10s
       timeout: 10s
       retries: 20
 
+  # ---------------------------------------------------------------------------
+  # Kong Data Plane 1 (DP1)
+  # Serves actual customer API traffic. Responsibilities:
+  #   - Receives config from CP via cluster connection
+  #   - Proxies incoming API requests to backend services
+  #   - Enforces plugins (rate limiting, auth, etc.) on every request
+  #   - Runs independently — keeps serving traffic even if CP goes down
+  #   - Does NOT connect to PostgreSQL (KONG_DATABASE: "off")
+  #
+  # Traffic flow: Client → Nginx LB → DP1 (or DP2) → Backend API
+  # ---------------------------------------------------------------------------
   kong-dp1:
     image: ${KONG_IMAGE:-kong/kong-gateway:3.10}
     container_name: kong-dp1
     restart: unless-stopped
     depends_on:
       kong-cp:
-        condition: service_healthy
+        condition: service_healthy   # Wait for CP to be ready before connecting
     environment:
+      # This node is a Data Plane — serves traffic, gets config from CP
       KONG_ROLE: data_plane
-      KONG_DATABASE: "off"
+      KONG_DATABASE: "off"           # DPs do NOT use the database directly
 
-      # Hybrid DP -> CP
-      KONG_CLUSTER_CONTROL_PLANE: kong-cp:8005
-      KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-cp:8006
-      KONG_CLUSTER_MTLS: shared
-      KONG_CLUSTER_SERVER_NAME: kong_clustering
-      KONG_CLUSTER_TELEMETRY_SERVER_NAME: kong_clustering
-      KONG_CLUSTER_DP_LABELS: hostname:kong-cp
+      # ---------------------------------------------------------------------------
+      # CP Connection Settings
+      # DP connects to CP to receive config updates
+      # CRITICAL: Server names must match CN=kong_clustering in the cert
+      # ---------------------------------------------------------------------------
+      KONG_CLUSTER_CONTROL_PLANE: kong-cp:8005              # CP cluster endpoint
+      KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-cp:8006         # CP telemetry endpoint
+      KONG_CLUSTER_MTLS: shared                             # Use shared cert mode
+      KONG_CLUSTER_SERVER_NAME: kong_clustering             # Must match cert CN
+      KONG_CLUSTER_TELEMETRY_SERVER_NAME: kong_clustering   # Must match cert CN
+      KONG_CLUSTER_DP_LABELS: hostname:kong-cp              # Label for identification
 
-      # Same shared mTLS cert/key pair copied to DP nodes
+      # Same cluster cert used by CP — shared mTLS authentication
       KONG_CLUSTER_CERT: /etc/kong/certs/cluster.crt
       KONG_CLUSTER_CERT_KEY: /etc/kong/certs/cluster.key
 
-      # DP proxy listeners only
+      # DP only listens for proxy traffic — Admin API is disabled for security
       KONG_PROXY_LISTEN: 0.0.0.0:8000, 0.0.0.0:8443 ssl
-      KONG_ADMIN_LISTEN: "off"
-      KONG_ADMIN_GUI_LISTEN: "off"
+      KONG_ADMIN_LISTEN: "off"        # No admin access on Data Planes
+      KONG_ADMIN_GUI_LISTEN: "off"    # No UI on Data Planes
 
       KONG_LOG_LEVEL: info
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
+
     ports:
-      - "8100:8000"   # DP1 proxy HTTP from Mac
-      - "8143:8443"   # DP1 proxy HTTPS from Mac
+      - "8100:8000"   # DP1 HTTP proxy — direct access for testing
+      - "8143:8443"   # DP1 HTTPS proxy
     volumes:
-      - ./certs:/etc/kong/certs:ro
+      - ./certs:/etc/kong/certs:ro   # Mount certs as read-only
     networks:
       - kong-net
 
+  # ---------------------------------------------------------------------------
+  # Kong Data Plane 2 (DP2)
+  # Identical to DP1 — second instance for high availability and load balancing.
+  # Nginx LB distributes traffic between DP1 and DP2 using round-robin.
+  # If DP1 goes down, all traffic automatically goes to DP2 and vice versa.
+  # ---------------------------------------------------------------------------
   kong-dp2:
     image: ${KONG_IMAGE:-kong/kong-gateway:3.10}
     container_name: kong-dp2
@@ -141,7 +222,6 @@ services:
       KONG_ROLE: data_plane
       KONG_DATABASE: "off"
 
-      # Hybrid DP -> CP
       KONG_CLUSTER_CONTROL_PLANE: kong-cp:8005
       KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-cp:8006
       KONG_CLUSTER_MTLS: shared
@@ -149,11 +229,9 @@ services:
       KONG_CLUSTER_TELEMETRY_SERVER_NAME: kong_clustering
       KONG_CLUSTER_DP_LABELS: hostname:kong-cp
 
-      # Same shared mTLS cert/key pair copied to DP nodes
       KONG_CLUSTER_CERT: /etc/kong/certs/cluster.crt
       KONG_CLUSTER_CERT_KEY: /etc/kong/certs/cluster.key
 
-      # DP proxy listeners only
       KONG_PROXY_LISTEN: 0.0.0.0:8000, 0.0.0.0:8443 ssl
       KONG_ADMIN_LISTEN: "off"
       KONG_ADMIN_GUI_LISTEN: "off"
@@ -161,35 +239,54 @@ services:
       KONG_LOG_LEVEL: info
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
+
     ports:
-      - "8200:8000"   # DP2 proxy HTTP from Mac
-      - "8243:8443"   # DP2 proxy HTTPS from Mac
+      - "8200:8000"   # DP2 HTTP proxy — direct access for testing
+      - "8243:8443"   # DP2 HTTPS proxy
     volumes:
       - ./certs:/etc/kong/certs:ro
     networks:
       - kong-net
 
-  # Local NLB-like reverse proxy in front of both Data Planes.
-  # apigw.placsoft.local -> localhost:8443 -> nginx -> kong-dp1/kong-dp2:8443
+  # ---------------------------------------------------------------------------
+  # Nginx Load Balancer
+  # Sits in front of both Data Planes and distributes traffic between them.
+  # Uses round-robin by default — request 1 → DP1, request 2 → DP2, repeat.
+  # Config is in nginx-lb.conf — defines upstream servers and SSL termination.
+  #
+  # In production this would be an AWS ALB, Azure Load Balancer, or similar.
+  # For local dev, Nginx simulates that behavior.
+  # ---------------------------------------------------------------------------
   dp-lb:
     image: nginx:1.27-alpine
     container_name: kong-dp-lb
     restart: unless-stopped
     depends_on:
-      - kong-dp1
+      - kong-dp1   # Both DPs must be running before LB starts
       - kong-dp2
     ports:
-      - "8080:8080"   # local LB HTTP
-      - "8443:8443"   # local LB HTTPS, mapped to apigw.placsoft.local
+      - "8080:8080"   # LB HTTP — main entry point for API traffic
+      - "8443:8443"   # LB HTTPS — SSL termination here
     volumes:
-      - ./nginx-lb.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/etc/nginx/certs:ro
+      - ./nginx-lb.conf:/etc/nginx/nginx.conf:ro   # Nginx LB config
+      - ./certs:/etc/nginx/certs:ro                # TLS certs for HTTPS
     networks:
       - kong-net
 
+# =============================================================================
+# Volumes
+# Docker managed volumes that persist data across container restarts.
+# Run 'docker compose down -v' to delete all data and start completely fresh.
+# =============================================================================
 volumes:
-  kong-db-data:
+  kong-db-data:   # PostgreSQL data — all Kong config persisted here
 
+# =============================================================================
+# Networks
+# All containers share one internal network (kong-net).
+# Containers communicate using their service names as hostnames.
+# Example: kong-cp connects to kong-db using hostname 'kong-db'
+# =============================================================================
 networks:
   kong-net:
     name: kong-net
